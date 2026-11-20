@@ -1,97 +1,69 @@
-import fs from 'fs';
-import { fileURLToPath } from 'url';
-import * as path from 'path';
-import process from 'process';
+import fs from 'node:fs';
+import process from 'node:process';
+import { parseArgs } from 'node:util';
 
-// Dynamically import ESM modules
-const commonModule = await import('./plugin/common.js');
-const jjencodeModule = await import('./plugin/jjencode.js');
-const sojsonModule = await import('./plugin/sojson.js');
-const sojsonv7Module = await import('./plugin/sojsonv7.js');
-const obfuscatorModule = await import('./plugin/obfuscator.js');
-const awscModule = await import('./plugin/awsc.js');
-const jsconfuserModule = await import('./plugin/jsconfuser.js');
+// Load only the decoder being tried. A Packer/common-only run should not fail
+// merely because an unrelated native addon is unavailable.
+const pluginNames = ['packer', 'obfuscator', 'sojsonv7', 'sojson', 'jsconfuser', 'awsc', 'jjencode', 'common'];
+const usage = `Usage: node src/main.js [-i input.js] [-o output.js] [-t auto|${pluginNames.join('|')}]
+  -i, --input   Input file (default: input.js)
+  -o, --output  Output file (default: output.js)
+  -t, --type    Decoder to use (default: auto)
+  -h, --help    Show this help`;
 
-// Provide default exports if necessary
-const PluginCommon = commonModule.default || commonModule;
-const PluginJjencode = jjencodeModule.default || jjencodeModule;
-const PluginSojson = sojsonModule.default || sojsonModule;
-const PluginSojsonV7 = sojsonv7Module.default || sojsonv7Module;
-const PluginObfuscator = obfuscatorModule.default || obfuscatorModule;
-const PluginAwsc = awscModule.default || awscModule;
-const PluginJsconfuser = jsconfuserModule.default || jsconfuserModule;
-// Read command-line arguments
-let encodeFile = 'input.js';
-let decodeFile = 'output.js';
-
-for (let i = 2; i < process.argv.length; i += 2) {
-  if (process.argv[i] === '-i') {
-    encodeFile = process.argv[i + 1];
-  } else if (process.argv[i] === '-o') {
-    decodeFile = process.argv[i + 1];
-  }
-}
-
-console.log(`输入: ${encodeFile}`);
-console.log(`输出: ${decodeFile}`);
-
-// Read source code
-const sourceCode = fs.readFileSync(encodeFile, { encoding: 'utf-8' });
-
-let processedCode = sourceCode;
-let pluginUsed = '';
-let time;
-
-// Try plugins in sequence until the processed code differs from the original
-const plugins = [
-  { name: 'obfuscator', plugin: PluginObfuscator },
-  { name: 'sojsonv7', plugin: PluginSojsonV7 },
-    { name: 'sojson', plugin: PluginSojson },
-
-  { name: 'jsconfuser', plugin: PluginJsconfuser },
-  { name: 'awsc', plugin: PluginAwsc },
-  { name: 'jjencode', plugin: PluginJjencode },
-  { name: 'common', plugin: PluginCommon }, // Use common plugin last
-];
-
-for (const plugin of plugins) {
-  // Check for specific string in sourceCode to break early
-  if (sourceCode.indexOf('smEcV') !== -1) {
-    break;
-  }
-
-  try {
-    const code = plugin.plugin(sourceCode);
-    if (code && code !== processedCode) {
-      processedCode = code;
-      pluginUsed = plugin.name;
-      break;
-    }
-  } catch (error) {
-    console.error(`插件 ${plugin.name} 处理时发生错误: ${error.message}`);
-  }
-}
-
-// Check if processed code differs from source code
-if (processedCode !== sourceCode) {
-  time = new Date();
-  const header = [
-    `//${time}`,
-    "//Base:<url id=\"cv1cref6o68qmpt26ol0\" type=\"url\" status=\"parsed\" title=\"GitHub - echo094/decode-js: JS混淆代码的AST分析工具 AST analysis tool for obfuscated JS code\" wc=\"2165\">https://github.com/echo094/decode-js</url>",
-    "//Modify:<url id=\"cv1cref6o68qmpt26olg\" type=\"url\" status=\"parsed\" title=\"GitHub - smallfawn/decode_action: 世界上本来不存在加密，加密的人多了，也便成就了解密\" wc=\"741\">https://github.com/smallfawn/decode_action</url>"
-  ].join('\n');
-
-  // Combine header and processed code
-  const outputCode = header + '\n' + processedCode;
-
-  // Write to file
-  fs.writeFile(decodeFile, outputCode, (err) => {
-    if (err) {
-      throw err;
-    } else {
-      console.log(`使用插件 ${pluginUsed} 成功处理并写入文件 ${decodeFile}`);
-    }
+async function main() {
+  const { values } = parseArgs({
+    options: {
+      input: { type: 'string', short: 'i', default: 'input.js' },
+      output: { type: 'string', short: 'o', default: 'output.js' },
+      type: { type: 'string', short: 't', default: 'auto' },
+      help: { type: 'boolean', short: 'h', default: false },
+    },
+    strict: true,
+    allowPositionals: false,
   });
-} else {
-  console.log(`所有插件处理后的代码与原代码一致，未写入文件。`);
+  if (values.help) {
+    console.log(usage);
+    return;
+  }
+  if (values.type !== 'auto' && !pluginNames.includes(values.type)) {
+    throw new Error(`未知解码器: ${values.type}\n${usage}`);
+  }
+  console.log(`输入: ${values.input}`);
+  console.log(`输出: ${values.output}`);
+  const source = fs.readFileSync(values.input, 'utf8');
+  let decoded = source;
+  let pluginUsed = '';
+  const selected = values.type === 'auto' ? pluginNames : [values.type];
+  for (const name of selected) {
+    try {
+      const { default: decode } = await import(`./plugin/${name}.js`);
+      const result = decode(source);
+      if (typeof result === 'string' && result !== source) {
+        decoded = result;
+        pluginUsed = name;
+        break;
+      }
+      if (values.type !== 'auto' && result === null) {
+        throw new Error('输入不符合该解码器支持的格式');
+      }
+    } catch (error) {
+      if (values.type !== 'auto') throw error;
+      console.error(`插件 ${name} 未完成处理: ${error.message}`);
+    }
+  }
+  const header = [
+    '// Decoded by decode_action',
+    '// Base: https://github.com/echo094/decode-js',
+    '// Project: https://github.com/smallfawn/decode_action',
+  ].join('\n');
+  fs.writeFileSync(values.output, pluginUsed ? `${header}\n${decoded}` : source, 'utf8');
+  console.log(pluginUsed
+    ? `使用插件 ${pluginUsed} 解码；已写入 ${values.output}`
+    : `未匹配到转换结果，已将原文写入 ${values.output}`);
 }
+
+main().catch((error) => {
+  console.error(`JavaScript 解码失败: ${error.message}`);
+  process.exitCode = 1;
+});

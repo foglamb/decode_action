@@ -1,44 +1,123 @@
-name: Decode JavaScript File
+name: Decode JavaScript and Python
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
+  pull_request:
+
+concurrency:
+  group: decode-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   decode:
+    name: Decode ${{ matrix.language }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript, python]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node.js
+        if: matrix.language == 'javascript'
+        uses: actions/setup-node@v4
+        with:
+          # Compatibility pin for isolated-vm 4.x; do not use the runner default.
+          node-version: '20'
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        if: matrix.language == 'javascript'
+        run: npm ci --no-audit --no-fund
+
+      - name: Decode JavaScript input
+        if: matrix.language == 'javascript'
+        run: |
+          mkdir -p decoded-output
+          timeout 300s npm run decode -- -i input.js -o decoded-output/output.js
+
+      - name: Decode Python input
+        if: matrix.language == 'python'
+        run: |
+          mkdir -p decoded-output
+          timeout 300s python src/decode.py -i input.py -o decoded-output/output.py
+
+      - name: Run regression tests
+        if: matrix.language == 'javascript'
+        run: npm test
+
+      - name: Upload available output even if a later step failed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: decoded-output-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.language }}
+          path: decoded-output/
+          if-no-files-found: warn
+          retention-days: 7
+
+  publish:
+    needs: decode
+    if: github.event_name != 'pull_request' && github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v2
-
-      # 👇 添加这一步来指定 Node 版本
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Checkout target branch
+        uses: actions/checkout@v4
         with:
-          node-version: '20'   # 使用 Node 20 LTS，避免 isolated-vm 编译错误
+          ref: ${{ github.ref_name }}
 
-      - name: Execute Python script for decoding
+      - name: Check that the input revision is still current
+        id: revision
         run: |
-          python src/decode.py
+          if [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Branch changed during decoding; use the newer run. Outputs remain in artifacts."
+          fi
 
-      - name: Install dependencies and run decode
-        run: |
-          npm install
-          npm run decode -- -i input.js -o output.js   # 修正了参数传递写法
+      - name: Download decoded files
+        if: steps.revision.outputs.current == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: decoded-output-${{ github.run_id }}-${{ github.run_attempt }}-*
+          merge-multiple: true
+          path: decoded-output
 
-      - name: Configure Git author
+      - name: Validate and publish only the expected output files
+        if: steps.revision.outputs.current == 'true'
         run: |
+          test -f decoded-output/output.js
+          test ! -L decoded-output/output.js
+          test -f decoded-output/output.py
+          test ! -L decoded-output/output.py
+          test ! -L output.js
+          test ! -L output.py
+          cp -- decoded-output/output.js output.js
+          cp -- decoded-output/output.py output.py
           git config --local user.email "action@github.com"
           git config --local user.name "action"
-
-      - name: Save decoded output to repository
-        run: |
-          git status
-          ls
-          git add output.js
-          git add output.py
-          git commit -m "Add decoded output file"
-          git push
+          git add -- output.js output.py
+          if git diff --cached --quiet; then
+            echo "No output changes to commit."
+          else
+            git commit -m "Add decoded output file"
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
