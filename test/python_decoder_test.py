@@ -149,6 +149,51 @@ class PythonDecoderTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.decode(source)[0], source.encode())
 
+    def test_lambda_parameter_masks_outer_decoder(self):
+        source = (
+            'decode=lambda value: b"pass"\n'
+            'exec((lambda decode: decode(b"ignored"))(b"not callable"))'
+        )
+        self.assertEqual(self.decode(source)[0], source.encode())
+
+    def test_nested_lambda_respects_lexical_scope(self):
+        sources = (
+            'data=b"pass"\nouter=lambda other: data\n'
+            'exec((lambda data: outer(b"unused"))(b"wrong"))',
+            'exec((lambda data: (lambda other: data)(b"unused"))(b"pass"))',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(self.decode(source)[0], b'pass')
+
+    def test_imports_after_exec_are_not_discarded_or_used_early(self):
+        for source in (
+            'exec(base64.b64decode("cGFzcw=="))\nimport zlib\n',
+            'from codecs import decode\nexec(decode(b"cGFzcw=="))\n'
+            'from base64 import b64decode as decode\n',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.decode(source)[0], source.encode())
+
+    def test_import_rebinding_replaces_previous_binding(self):
+        for previous in ('decode=b"old value"', 'decode=lambda value: b"old value"'):
+            source = (
+                f'{previous}\nfrom base64 import b64decode as decode\n'
+                'exec(decode(b"cGFzcw=="))'
+            )
+            with self.subTest(previous=previous):
+                self.assertEqual(self.decode(source)[0], b'pass')
+
+    def test_try_wrapper_does_not_drop_finally_or_else(self):
+        sources = (
+            'try:\n exec(base64.b64decode("cGFzcw=="))\nfinally:\n print("keep")\n',
+            'try:\n exec(base64.b64decode("cGFzcw=="))\nexcept Exception:\n pass\n'
+            'else:\n print("keep")\n',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(self.decode(source)[0], source.encode())
+
     def test_cli_custom_paths(self):
         with tempfile.TemporaryDirectory(prefix='decode-python-cli-') as temp:
             directory = Path(temp)

@@ -47,6 +47,23 @@ test('Packer rejects unrelated statements and invalid metadata', () => {
   assert.equal(decodePacker('eval(customDecoder("data"));'), null);
 });
 
+test('Packer recognizes only a static split property', () => {
+  const packed = pack('0();', ['value']);
+  assert.equal(decodePacker(packed.replace('.split(', '["split"](')), 'value();');
+  assert.equal(decodePacker(packed.replace('.split(', '[split](')), null);
+});
+
+test('Packer rejects an invalid radix for the wrapper encoder', () => {
+  assert.equal(decodePacker(pack('0();', ['value'], 62)), null);
+});
+
+test('Packer preserves sources with directives and non-synchronous wrappers', () => {
+  const packed = pack('0();', ['value']);
+  assert.equal(decodePacker('"use strict";\n' + packed), null);
+  assert.equal(decodePacker(packed.replace('function(', 'function*(')), null);
+  assert.equal(decodePacker(packed.replace('function(', 'async function(')), null);
+});
+
 test('explicit packer selection works for custom unicode file paths', () => {
   const result = run(pack('0("1");', ['console.log', 'cli']), ['--type', 'packer']);
   assert.equal(result.status, 0, result.stderr);

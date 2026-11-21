@@ -33,7 +33,7 @@ JS 的 `-t` / `--type` 可选择 `auto`、`packer`、`obfuscator`、`sojsonv7`�
 | 类型 | 能力 | 边界 |
 | --- | --- | --- |
 | JS 既有 AST 插件 | sojson、sojsonv7、obfuscator、jsconfuser、awsc、jjencode、common | 保留原项目实现，不表示覆盖这些工具的所有版本或配置 |
-| JS Packer | 经典 `eval(function(p,a,c,k,e,d){...})`，字典进制 2–62、嵌套包装、字典词碰撞处理 | 静态识别，不执行打包函数；不支持任意改造后的自定义 eval |
+| JS Packer | 经典 `eval(function(p,a,c,k,e,d){...})`，支持 `.split` 和 `["split"]` 字典、进制 2–62 及嵌套包装 | 进制 37–62 需要对应的扩展进制编码函数。解析过程仅读取静态参数 |
 | Python Base 编码 | Base64 / URL-safe Base64、Base16、Base32、Base85、Ascii85 | 静态字符串或字节串参数；Base64 允许缺少填充 |
 | Python 其他编码 | `bytes.fromhex`、`binascii.unhexlify`、`codecs.decode` 的 ROT13 / hex / Base64 | 不扩展任意 Python 函数或未知编码器 |
 | Python 压缩 | gzip、bz2、zlib、lzma，支持组合和多层包装 | 单层解包结果上限 16 MiB，压缩成员和脚本层数均有上限 |

@@ -8,6 +8,7 @@ import codecs
 import gzip
 import lzma
 import operator
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 import zlib
@@ -76,35 +77,61 @@ def peel_compression(data, steps):
     return data
 
 
+@dataclass(frozen=True)
+class ImportedName:
+    name: str
+
+
+UNBOUND = object()
+
+
 class StaticDecoder:
     def __init__(self):
-        self.aliases = {name: name for name in MODULES}
-        self.constants = {}
-        self.functions = {}
+        self.bindings = {}
         self.steps = []
         self.operations = 0
 
-    def qualified_name(self, node):
+    def binding(self, name, local):
+        if name in local:
+            return local[name]
+        return self.bindings.get(name, UNBOUND)
+
+    def qualified_name(self, node, local):
         if isinstance(node, ast.Name):
-            if node.id in self.constants or node.id in self.functions:
-                return ''
-            return self.aliases.get(node.id, node.id)
+            binding = self.binding(node.id, local)
+            if isinstance(binding, ImportedName):
+                return binding.name
+            return node.id if binding is UNBOUND else ''
         if isinstance(node, ast.Attribute):
-            parent = self.qualified_name(node.value)
+            parent = self.qualified_name(node.value, local)
             return f'{parent}.{node.attr}' if parent else ''
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == '__import__' and '__import__' not in self.constants and '__import__' not in self.functions and len(node.args) == 1 and not node.keywords and isinstance(node.args[0], ast.Constant) and node.args[0].value in MODULES:
-            return node.args[0].value  # Recognize a module name; never import input code.
+        if (
+            isinstance(node, ast.Call)
+            and self.qualified_name(node.func, local) == '__import__'
+            and len(node.args) == 1 and not node.keywords
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and node.args[0].value in MODULES
+        ):
+            return node.args[0].value  # Recognize a module name without importing input code.
         return ''
 
-    def expression(self, node, depth=0):
+    def expression(self, node, depth=0, local=None):
         self.operations += 1
         if depth > 64 or self.operations > 2_000_000:
             raise Unsupported('静态表达式复杂度超过上限')
-        evaluate = lambda item: self.expression(item, depth + 1)
+        if local is None:
+            local = {}
+
+        def evaluate(item):
+            return self.expression(item, depth + 1, local)
+
         if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes, int, type(None))):
             return checked(node.value)
-        if isinstance(node, ast.Name) and node.id in self.constants:
-            return self.constants[node.id]
+        if isinstance(node, ast.Name):
+            binding = self.binding(node.id, local)
+            if binding is not UNBOUND and not isinstance(binding, (ImportedName, ast.Lambda)):
+                return binding
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
             value = evaluate(node.operand)
             if type(value) is int:
@@ -133,25 +160,22 @@ class StaticDecoder:
             targets = clause.target.elts if isinstance(clause.target, ast.Tuple) else [clause.target]
             if not all(isinstance(target, ast.Name) for target in targets):
                 raise Unsupported('不支持的字符映射变量')
-            previous = self.constants.copy()
+            scope = local.copy()
             result, total = [], 0
-            try:
-                for index, item in enumerate(items):
-                    if index >= 1_000_000:
-                        raise Unsupported('字符映射次数超过上限')
-                    values = item if isinstance(clause.target, ast.Tuple) else [item]
-                    if len(values) != len(targets):
-                        raise Unsupported('字符映射解构数量不匹配')
-                    self.constants.update((target.id, value) for target, value in zip(targets, values))
-                    value = evaluate(node.elt)
-                    if not isinstance(value, (str, bytes)):
-                        raise Unsupported('字符映射必须返回文本')
-                    total += len(value)
-                    if total > MAX_BYTES:
-                        raise Unsupported('字符映射结果超过上限')
-                    result.append(value)
-            finally:
-                self.constants = previous
+            for index, item in enumerate(items):
+                if index >= 1_000_000:
+                    raise Unsupported('字符映射次数超过上限')
+                values = item if isinstance(clause.target, ast.Tuple) else [item]
+                if len(values) != len(targets):
+                    raise Unsupported('字符映射解构数量不匹配')
+                scope.update((target.id, value) for target, value in zip(targets, values))
+                value = self.expression(node.elt, depth + 1, scope)
+                if not isinstance(value, (str, bytes)):
+                    raise Unsupported('字符映射必须返回文本')
+                total += len(value)
+                if total > MAX_BYTES:
+                    raise Unsupported('字符映射结果超过上限')
+                result.append(value)
             return result
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
             value = evaluate(node.value)
@@ -163,22 +187,24 @@ class StaticDecoder:
             raise Unsupported('存在无法静态求值的表达式')
         if any(keyword.arg is None for keyword in node.keywords):
             raise Unsupported('不展开动态关键字参数')
-        function = self.functions.get(node.func.id) if isinstance(node.func, ast.Name) else node.func
+        is_named = isinstance(node.func, ast.Name)
+        function = self.binding(node.func.id, local) if is_named else node.func
         if isinstance(function, ast.Lambda):
-            # Interpret only supported expressions in a one-argument wrapper.
+            # A named wrapper sees module bindings. An inline lambda can also
+            # refer to its surrounding parameters or generator variables.
             params = function.args
-            if len(params.args) != 1 or params.posonlyargs or params.kwonlyargs or params.vararg or params.kwarg or params.defaults or node.keywords or len(node.args) != 1:
+            if (
+                len(params.args) != 1 or params.posonlyargs or params.kwonlyargs
+                or params.vararg or params.kwarg or params.defaults
+                or node.keywords or len(node.args) != 1
+            ):
                 raise Unsupported('仅支持单参数静态 lambda 包装')
-            key = params.args[0].arg
-            previous = self.constants.copy()
-            self.constants[key] = evaluate(node.args[0])
-            try:
-                return evaluate(function.body)
-            finally:
-                self.constants = previous
+            scope = {} if is_named else local.copy()
+            scope[params.args[0].arg] = evaluate(node.args[0])
+            return self.expression(function.body, depth + 1, scope)
         args = [evaluate(argument) for argument in node.args]
         kwargs = {keyword.arg: evaluate(keyword.value) for keyword in node.keywords}
-        name = self.qualified_name(node.func)
+        name = self.qualified_name(node.func, local)
         result = None
         if name == 'compile' and len(args) == 3 and args[2] == 'exec' and not kwargs:
             return args[0]  # Do not create or execute a code object.
@@ -229,43 +255,47 @@ class StaticDecoder:
     def unwrap(self, source):
         tree = ast.parse(source)
         statements = tree.body
-        meaningful = [item for item in statements if not (isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant) and isinstance(item.value.value, str))]
-        if len(meaningful) == 1 and isinstance(meaningful[0], ast.Try) and not meaningful[0].orelse and not meaningful[0].finalbody:
-            # A common packer surrounds the data wrapper with an error handler.
-            # We inspect its body only; neither body nor handler is executed.
-            statements = meaningful[0].body
-        expression = None
-        for statement in statements:
+        if ast.get_docstring(tree, clean=False) is not None:
+            statements = statements[1:]
+        if len(statements) == 1 and isinstance(statements[0], ast.Try):
+            wrapper = statements[0]
+            if not wrapper.orelse and not wrapper.finalbody:
+                # Inspect the body of a simple error-handling wrapper.
+                statements = wrapper.body
+        for index, statement in enumerate(statements):
             if isinstance(statement, ast.Import):
                 for item in statement.names:
                     if item.name not in MODULES:
                         raise Unsupported('包装引用了未知模块')
-                    self.aliases[item.asname or item.name] = item.name
+                    self.bindings[item.asname or item.name] = ImportedName(item.name)
             elif isinstance(statement, ast.ImportFrom) and statement.module in MODULES and not statement.level:
                 for item in statement.names:
                     if item.name == '*':
                         raise Unsupported('不解析星号导入')
-                    self.aliases[item.asname or item.name] = f'{statement.module}.{item.name}'
-            elif isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name) and expression is None:
-                key = statement.targets[0].id
-                if isinstance(statement.value, ast.Lambda):
-                    self.functions[key] = statement.value
-                    self.constants.pop(key, None)
-                else:
-                    self.constants[key] = self.expression(statement.value)
-                    self.functions.pop(key, None)
-            elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str):
-                continue  # Module docstring.
-            elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call) and self.qualified_name(statement.value.func) == 'exec' and expression is None and len(statement.value.args) == 1 and not statement.value.keywords:
-                expression = statement.value.args[0]
+                    self.bindings[item.asname or item.name] = ImportedName(f'{statement.module}.{item.name}')
+            elif (
+                isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+            ):
+                value = statement.value
+                self.bindings[statement.targets[0].id] = (
+                    value if isinstance(value, ast.Lambda) else self.expression(value)
+                )
+            elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+                call = statement.value
+                if (
+                    self.qualified_name(call.func, {}) == 'exec'
+                    and len(call.args) == 1 and not call.keywords
+                    and index == len(statements) - 1
+                ):
+                    value = self.expression(call.args[0])
+                    if not isinstance(value, (str, bytes)):
+                        raise Unsupported('包装结果不是源码文本或字节串')
+                    return peel_compression(value, self.steps)
+                raise Unsupported('不是以单一 exec 结尾的数据包装')
             else:
                 raise Unsupported('不是单一 exec 数据包装，保留整个脚本')
-        if expression is None:
-            return None
-        value = self.expression(expression)
-        if not isinstance(value, (str, bytes)):
-            raise Unsupported('包装结果不是源码文本或字节串')
-        return peel_compression(value, self.steps)
+        return None
 
 
 def decode_source(source):

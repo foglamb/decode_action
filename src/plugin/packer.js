@@ -26,6 +26,7 @@ function getWrapper(code) {
   }
 
   if (
+    ast.program.directives.length > 0 ||
     ast.program.body.filter((statement) => !t.isEmptyStatement(statement)).length !== 1
   ) {
     return null;
@@ -45,23 +46,27 @@ function getWrapper(code) {
     if (!t.isCallExpression(packedCall) || !t.isFunctionExpression(packedCall.callee)) {
       continue;
     }
+    const packer = packedCall.callee;
+    if (packer.async || packer.generator) continue;
 
     const [payload, radixNode, countNode, tableCall] = packedCall.arguments;
+    const split = t.isCallExpression(tableCall) ? tableCall.callee : null;
     if (
       !t.isStringLiteral(payload) ||
       !t.isNumericLiteral(radixNode) ||
       !t.isNumericLiteral(countNode) ||
-      !t.isCallExpression(tableCall) ||
-      !t.isMemberExpression(tableCall.callee) ||
-      !t.isIdentifier(tableCall.callee.property, { name: 'split' }) ||
-      !t.isStringLiteral(tableCall.callee.object) ||
+      !t.isMemberExpression(split) ||
+      (split.computed
+        ? !t.isStringLiteral(split.property, { value: 'split' })
+        : !t.isIdentifier(split.property, { name: 'split' })) ||
+      !t.isStringLiteral(split.object) ||
       tableCall.arguments.length !== 1 ||
       !t.isStringLiteral(tableCall.arguments[0])
     ) {
       continue;
     }
 
-    const params = packedCall.callee.params;
+    const params = packer.params;
     if (
       !t.isIdentifier(params[0], { name: 'p' }) ||
       !t.isIdentifier(params[1], { name: 'a' }) ||
@@ -72,7 +77,7 @@ function getWrapper(code) {
     }
 
     // Confirm the canonical Packer replacement loop without executing it.
-    const functionSource = code.slice(packedCall.callee.start, packedCall.callee.end);
+    const functionSource = code.slice(packer.start, packer.end);
     const simpleEncoder =
       /\be\s*=\s*function\s*\(\s*c\s*\)\s*\{\s*return\s+c\.toString\s*\(\s*a\s*\)\s*;?\s*\}/.test(functionSource);
     const radix62Encoder =
@@ -91,10 +96,11 @@ function getWrapper(code) {
 
     const radix = radixNode.value;
     const count = countNode.value;
-    if (!Number.isInteger(radix) || radix < 2 || radix > DIGITS.length) continue;
+    const maxRadix = radix62Encoder ? DIGITS.length : 36;
+    if (!Number.isInteger(radix) || radix < 2 || radix > maxRadix) continue;
     if (!Number.isInteger(count) || count < 0 || count > 100000) continue;
 
-    const words = tableCall.callee.object.value.split(tableCall.arguments[0].value);
+    const words = split.object.value.split(tableCall.arguments[0].value);
     const fastReplace = /(?:''|\"\")\.replace\(\s*\/\^\/\s*,\s*String\s*\)/.test(functionSource);
     return { payload: payload.value, radix, count, words, fastReplace };
   }
