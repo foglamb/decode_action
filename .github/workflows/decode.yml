@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - verify/decode-e2e-20261121
   workflow_dispatch:
   pull_request:
 
